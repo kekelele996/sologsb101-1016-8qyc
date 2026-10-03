@@ -12,6 +12,7 @@ import {
   db,
   initDatabase,
   putSchedule,
+  recomputeClearance,
   removeSchedule,
   reorderSchedules,
 } from '../utils/db';
@@ -84,6 +85,14 @@ function createScheduleStore() {
       operator: draft.operator.trim(),
       state: draft.state,
       orderIndex: draft.orderIndex,
+      // 放行判定由 db.putSchedule 内的串级重算回填，先给安全默认值
+      clearance: '未达标',
+      permitId: '',
+      permitVersion: 0,
+      clearanceNote: '新建后尚未完成串级放行核算',
+      waitingForPondId: '',
+      shortfallM3: 0,
+      clearanceCheckedAt: stamp,
       createdAt: stamp,
       updatedAt: stamp,
       revision: 2,
@@ -120,6 +129,12 @@ function createScheduleStore() {
     const index = SCHEDULE_STATE_FLOW.indexOf(existing.state);
     if (index < 0 || index >= SCHEDULE_STATE_FLOW.length - 1) return null;
     const next = SCHEDULE_STATE_FLOW[index + 1];
+    // 串级闸门：只有「已放行」（许可有效 + 下游受纳容量核足）才能开始走水。
+    // 排队中的计划计划量与水位均未改动，容量空出后重算通过即可继续。
+    if (next === '走水中' && existing.clearance !== '已放行') {
+      setState('lastMessage', `串级闸门未开：${existing.clearanceNote || '化验室出卤许可未核过'}`);
+      return null;
+    }
     const pondStore = usePondStore();
     const stat = pondStore.statOf(existing.pondId);
     const actualDensity = stat.currentDensity > 0 ? stat.currentDensity : existing.targetDensity;
@@ -132,6 +147,12 @@ function createScheduleStore() {
         : `状态已推进为「${next}」`,
     );
     return next;
+  }
+
+  /** 手动触发串级放行重算（许可同步 / 闸口 / 水位变化后系统也会自动重算） */
+  async function recompute(): Promise<void> {
+    await recomputeClearance();
+    setState('lastMessage', '已按串级顺序重新核算放行：上游占用先扣受纳余量，后面的计划已重算');
   }
 
   /** 拖拽排序：把 fromId 移动到 toId 之前 */
@@ -170,6 +191,7 @@ function createScheduleStore() {
     updateSchedule,
     deleteSchedule,
     advance,
+    recompute,
     moveBefore,
     moveToIndex,
   };

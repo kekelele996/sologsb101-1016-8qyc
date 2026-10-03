@@ -1,6 +1,6 @@
 /**
  * 路由表（@solidjs/router）
- * /ponds、/gates、/observations、/assays、/schedules、/export
+ * /ponds、/gates、/observations、/assays、/permits、/schedules、/export
  * 每个路由都可以直接粘贴 URL 刷新打开（nginx 已配置 try_files 回退）。
  */
 import { Navigate, Route, Router } from '@solidjs/router';
@@ -9,6 +9,7 @@ import PondList from '../pages/PondList';
 import GateConfig from '../pages/GateConfig';
 import ObservationEntry from '../pages/ObservationEntry';
 import AssayEntry from '../pages/AssayEntry';
+import PermitBoard from '../pages/PermitBoard';
 import ScheduleBoard from '../pages/ScheduleBoard';
 import ExportView from '../pages/ExportView';
 
@@ -18,6 +19,7 @@ export const ROUTES = {
   gates: '/gates',
   observations: '/observations',
   assays: '/assays',
+  permits: '/permits',
   schedules: '/schedules',
   export: '/export',
 } as const;
@@ -28,7 +30,8 @@ export const NAV_ITEMS = [
   { path: ROUTES.gates, label: '闸门串级', hint: '走向拓扑 · 开度就地编辑' },
   { path: ROUTES.observations, label: '卤水日观测', hint: '密度 · 温度 · 蒸发量' },
   { path: ROUTES.assays, label: '离子组分', hint: '达标判定 · 组分曲线' },
-  { path: ROUTES.schedules, label: '走水编排', hint: '拖拽排序 · 出卤推进' },
+  { path: ROUTES.permits, label: '出卤许可', hint: '化验室只读镜像 · 同步重试 · 换发重判' },
+  { path: ROUTES.schedules, label: '走水编排', hint: '串级受纳容量放行 · 排队缺口' },
   { path: ROUTES.export, label: '晒程汇总', hint: '进度 · JSON 导入导出' },
 ] as const;
 
@@ -40,6 +43,7 @@ export function AppRouter() {
       <Route path={ROUTES.gates} component={GateConfig} />
       <Route path={ROUTES.observations} component={ObservationEntry} />
       <Route path={ROUTES.assays} component={AssayEntry} />
+      <Route path={ROUTES.permits} component={PermitBoard} />
       <Route path={ROUTES.schedules} component={ScheduleBoard} />
       <Route path={ROUTES.export} component={ExportView} />
       <Route path="*" component={() => <Navigate href={ROUTES.ponds} />} />

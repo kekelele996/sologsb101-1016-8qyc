@@ -12,7 +12,13 @@ import StatBadge from '../components/common/StatBadge';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
 import { useScheduleStore } from '../stores/scheduleStore';
-import { SCHEDULE_STATE_OPTIONS, type Schedule, type ScheduleDraft, type ScheduleState } from '../types/schedule';
+import {
+  SCHEDULE_STATE_OPTIONS,
+  type ClearanceStatus,
+  type Schedule,
+  type ScheduleDraft,
+  type ScheduleState,
+} from '../types/schedule';
 import { effectiveVerdict } from '../utils/brine';
 import { today } from '../utils/id';
 
@@ -29,6 +35,18 @@ const STATE_STYLE: Record<ScheduleState, string> = {
   已排: 'border-sky-300 bg-sky-50 text-sky-700',
   走水中: 'border-amber-300 bg-amber-50 text-amber-700',
   已出卤: 'border-emerald-300 bg-emerald-50 text-emerald-700',
+};
+
+const CLEARANCE_STYLE: Record<ClearanceStatus, string> = {
+  已放行: 'border-emerald-300 bg-emerald-50 text-emerald-700',
+  排队中: 'border-amber-300 bg-amber-50 text-amber-800',
+  未达标: 'border-rose-300 bg-rose-50 text-rose-700',
+};
+
+const CLEARANCE_ICON: Record<ClearanceStatus, string> = {
+  已放行: '✓',
+  排队中: '⏳',
+  未达标: '✕',
 };
 
 function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
@@ -86,6 +104,7 @@ export default function ScheduleBoard() {
 
   const stats = createMemo(() => {
     const list = ordered();
+    const pending = list.filter((row) => row.state !== '已出卤');
     return {
       total: list.length,
       pending: list.filter((row) => row.state === '待排').length,
@@ -93,6 +112,10 @@ export default function ScheduleBoard() {
       done: list.filter((row) => row.state === '已出卤').length,
       volume: Math.round(list.reduce((acc, row) => acc + row.volumeM3, 0) * 10) / 10,
       donePct: list.length === 0 ? 0 : Math.round((list.filter((row) => row.state === '已出卤').length / list.length) * 1000) / 10,
+      released: pending.filter((row) => row.clearance === '已放行').length,
+      queued: pending.filter((row) => row.clearance === '排队中').length,
+      blocked: pending.filter((row) => row.clearance === '未达标').length,
+      shortfall: Math.round(pending.reduce((acc, row) => acc + (row.shortfallM3 ?? 0), 0) * 10) / 10,
     };
   });
 
@@ -161,6 +184,10 @@ export default function ScheduleBoard() {
         <StatBadge label="走水中" value={stats().running} suffix="条" tone="warning" />
         <StatBadge label="已出卤" value={stats().done} suffix="条" tone="success" />
         <StatBadge label="计划总量" value={stats().volume} suffix="m³" tone="info" />
+        <StatBadge label="串级已放行" value={stats().released} suffix="条" tone="success" hint="许可有效且下游受纳容量核足" />
+        <StatBadge label="容量排队" value={stats().queued} suffix="条" tone="warning" hint="下游余量不足按序排队，计划量与水位未改" />
+        <StatBadge label="许可未过" value={stats().blocked} suffix="条" tone="default" hint="缺许可 / 不予放行 / 许可已换发" />
+        <StatBadge label="排队缺口合计" value={stats().shortfall} suffix="m³" tone="warning" />
         <StatBadge label="出卤完成率" value={`${stats().donePct}%`} percent={stats().donePct} tone="success" />
       </div>
 
@@ -172,10 +199,21 @@ export default function ScheduleBoard() {
 
       <section class="rounded-xl border border-slate-200 bg-white p-4">
         <header class="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <h2 class="text-[15px] font-semibold text-slate-800">走水与出卤编排</h2>
-          <button type="button" class={BTN_PRIMARY} onClick={openCreate} disabled={pondStore.state.ponds.length === 0}>
-            + 新建走水计划
-          </button>
+          <div>
+            <h2 class="text-[15px] font-semibold text-slate-800">走水与出卤编排</h2>
+            <p class="mt-0.5 text-xs text-slate-500">
+              放行按串级顺序核：先核化验室出卤许可（池号 + 取样日期），再按面积 × 可用水深算下游受纳余量；
+              上游先走的水先占余量，排在后面的重算，不足则排队并注明缺口，计划量与池水位一律不动。
+            </p>
+          </div>
+          <div class="flex items-center gap-2">
+            <button type="button" class={BTN_GHOST} onClick={() => void scheduleStore.recompute()}>
+              重算串级放行
+            </button>
+            <button type="button" class={BTN_PRIMARY} onClick={openCreate} disabled={pondStore.state.ponds.length === 0}>
+              + 新建走水计划
+            </button>
+          </div>
         </header>
 
         <FilterBar
@@ -255,6 +293,17 @@ export default function ScheduleBoard() {
                   <div class="text-xs text-slate-600">
                     <p>
                       计划量 <span class="tabular-nums font-medium text-slate-800">{row.volumeM3}</span> m³
+                      <Show when={row.state !== '已出卤'}>
+                        {' '}· 排队缺口{' '}
+                        <span
+                          class={`tabular-nums font-medium ${
+                            (row.shortfallM3 ?? 0) > 0 ? 'text-amber-700' : 'text-slate-400'
+                          }`}
+                        >
+                          {row.shortfallM3 ?? 0}
+                        </span>{' '}
+                        m³
+                      </Show>
                     </p>
                     <p>
                       组分判定{' '}
@@ -268,14 +317,39 @@ export default function ScheduleBoard() {
                       </span>
                     </p>
                   </div>
-                  <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
+                  <div class="flex flex-col items-stretch gap-1">
+                    <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
+                    <Show
+                      when={row.state !== '已出卤'}
+                      fallback={
+                        <span class="rounded border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-400">
+                          沿用原放行
+                        </span>
+                      }
+                    >
+                      <span
+                        class={`rounded border px-2 py-0.5 text-[11px] ${CLEARANCE_STYLE[row.clearance ?? '未达标']}`}
+                        title={row.clearanceNote ?? ''}
+                      >
+                        {CLEARANCE_ICON[row.clearance ?? '未达标']} {row.clearance ?? '未达标'}
+                      </span>
+                    </Show>
+                  </div>
                   <div class="flex flex-wrap items-center gap-2">
                     <button
                       class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"
-                      disabled={row.state === '已出卤'}
+                      disabled={
+                        row.state === '已出卤' ||
+                        (nextStateLabel(row.state) === '开始走水' && row.clearance !== '已放行')
+                      }
+                      title={
+                        nextStateLabel(row.state) === '开始走水' && row.clearance !== '已放行'
+                          ? row.clearanceNote
+                          : ''
+                      }
                       onClick={async () => {
                         const next = await scheduleStore.advance(row.id);
-                        if (next === null) scheduleStore.setMessage('该计划已处于「已出卤」状态');
+                        if (next === null) scheduleStore.setMessage(row.state === '已出卤' ? '该计划已处于「已出卤」状态' : `串级闸门未开：${row.clearanceNote}`);
                       }}
                     >
                       {nextStateLabel(row.state)}
@@ -287,6 +361,20 @@ export default function ScheduleBoard() {
                       删除
                     </button>
                   </div>
+                  <Show when={row.state !== '已出卤' && row.clearanceNote !== ''}>
+                    <p
+                      class={`w-full rounded-md px-2.5 py-1.5 text-xs leading-relaxed ${
+                        row.clearance === '已放行'
+                          ? 'bg-emerald-50/70 text-emerald-800'
+                          : row.clearance === '排队中'
+                            ? 'bg-amber-50 text-amber-800'
+                            : 'bg-rose-50 text-rose-700'
+                      }`}
+                    >
+                      {row.clearance === '排队中' ? '串级排队：' : row.clearance === '未达标' ? '放行未过：' : '放行依据：'}
+                      {row.clearanceNote}
+                    </p>
+                  </Show>
                 </li>
               )}
             </For>
@@ -379,6 +467,8 @@ export default function ScheduleBoard() {
           </label>
         </div>
         <p class="mt-3 rounded-md bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-500">
+          目标密度仅供调度员编排参考，不作为放行条件。保存后按串级顺序重算：化验室出卤许可（池号 + 取样日期）有效、
+          且下游池面积 ×（可用水深 − 当前水位）的受纳余量核足才放行；余量不足按序排队并注明缺口，系统不改计划量、不回写水位。
           状态推进到「已出卤」时，会把该池推进到下一蒸发阶段，并把最新一次观测的密度回写为当前实际密度。
         </p>
       </AppDialog>

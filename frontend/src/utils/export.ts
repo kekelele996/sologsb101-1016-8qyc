@@ -92,6 +92,9 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
     '最近判定',
     '走水计划数',
     '已完成出卤数',
+    '已放行数',
+    '排队数',
+    '排队缺口合计(m³)',
   ];
   const lines: string[] = [header.map(csvCell).join(',')];
   ponds.forEach((pond) => {
@@ -100,6 +103,7 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
     const pondAssays = assays.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
     const latestAssay = pondAssays.length > 0 ? pondAssays[pondAssays.length - 1] : null;
     const pondSchedules = schedules.filter((row) => row.pondId === pond.id);
+    const activeSchedules = pondSchedules.filter((row) => row.state !== '已出卤');
     lines.push(
       [
         pond.code,
@@ -117,6 +121,9 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
         latestAssay === null ? '—' : effectiveVerdict(latestAssay),
         pondSchedules.length,
         pondSchedules.filter((row) => row.state === '已出卤').length,
+        activeSchedules.filter((row) => row.clearance === '已放行').length,
+        activeSchedules.filter((row) => row.clearance === '排队中').length,
+        round1(activeSchedules.reduce((acc, row) => acc + (row.shortfallM3 ?? 0), 0)),
       ]
         .map(csvCell)
         .join(','),
@@ -158,13 +165,19 @@ export function buildBriefingText(ponds: Pond[], observations: Observation[], as
     const latest = pondObs.length > 0 ? pondObs[pondObs.length - 1] : null;
     const pondAssays = assays.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
     const lastAssay = pondAssays.length > 0 ? pondAssays[pondAssays.length - 1] : null;
-    const pending = schedules.filter((row) => row.pondId === pond.id && row.state !== '已出卤').length;
+    const pending = schedules.filter((row) => row.pondId === pond.id && row.state !== '已出卤');
+    const queued = pending.filter((row) => row.clearance === '排队中');
+    const shortfall = round1(queued.reduce((acc, row) => acc + (row.shortfallM3 ?? 0), 0));
+    const queueText =
+      queued.length === 0
+        ? ''
+        : `；串级排队 ${queued.length} 条（缺口合计 ${shortfall} m³，计划量与水位未改）`;
     lines.push(
       `· ${pond.code}（${pond.seriesName} / ${pond.stage} / ${pond.status}）最近密度 ${
         latest === null ? '无观测' : `${latest.densityGcm3} g/cm³（${latest.date}）`
       }，蒸发量 ${latest === null ? '—' : `${round1(latest.evapMm)} mm/d`}，组分判定 ${
         lastAssay === null ? '未化验' : effectiveVerdict(lastAssay)
-      }，待完成走水 ${pending} 条`,
+      }，待完成走水 ${pending.length} 条（已放行 ${pending.filter((row) => row.clearance === '已放行').length} 条）${queueText}`,
     );
   });
   return lines.join('\n');

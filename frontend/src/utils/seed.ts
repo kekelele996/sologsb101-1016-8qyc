@@ -9,7 +9,10 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { LabPermit, SyncBatch } from '../types/permit';
 import { autoVerdict, estimateEvapMm } from './brine';
+import { evaluateClearance } from './clearance';
+import { LAB_INITIAL_BATCH_NO, LAB_INITIAL_SYNC_BATCH_ID, initialLabPermits } from './labAdapter';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
 
@@ -129,19 +132,65 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
+  // 串级放行判定（clearance*）不在播种时手填，统一由 evaluateClearance 按
+  // 面积 × 可用水深的受纳容量与化验室许可重算后回填。
+  // 北-01 两条计划同走 北-02：a1 先走占 300 m³，a2 排后面要在剩余 60 m³ 上重算，
+  // 直接演示「上游先走了水、下游余量变少，后面的串级重算」。
   const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 300, operator: '韩江', state: '已排', orderIndex: 1, clearance: '未达标', permitId: '', permitVersion: 0, clearanceNote: '', waitingForPondId: '', shortfallM3: 0, clearanceCheckedAt: '' }),
+    wrap<Schedule>({ id: 'schedule-a2', pondId: SEED_IDS.pondA, planDate: '2026-10-03', targetDensity: 1.12, volumeM3: 100, operator: '韩江', state: '待排', orderIndex: 2, clearance: '未达标', permitId: '', permitVersion: 0, clearanceNote: '', waitingForPondId: '', shortfallM3: 0, clearanceCheckedAt: '' }),
+    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 3, clearance: '未达标', permitId: '', permitVersion: 0, clearanceNote: '', waitingForPondId: '', shortfallM3: 0, clearanceCheckedAt: '' }),
+    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 4, clearance: '未达标', permitId: '', permitVersion: 0, clearanceNote: '', waitingForPondId: '', shortfallM3: 0, clearanceCheckedAt: '' }),
+    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 5, clearance: '未达标', permitId: '', permitVersion: 0, clearanceNote: '', waitingForPondId: '', shortfallM3: 0, clearanceCheckedAt: '' }),
+    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 6, clearance: '已放行', permitId: '', permitVersion: 0, clearanceNote: '已出卤计划沿用当时的放行判定', waitingForPondId: '', shortfallM3: 0, clearanceCheckedAt: SEED_TIME }),
   ];
 
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  // ---------------- 化验室出卤许可（外部系统只读镜像，按池号 + 取样日期对上） ----------------
+  const labPermits: LabPermit[] = initialLabPermits();
+  const syncBatch: SyncBatch = {
+    id: LAB_INITIAL_SYNC_BATCH_ID,
+    remoteBatchNo: LAB_INITIAL_BATCH_NO,
+    action: '初次拉取',
+    state: '同步成功',
+    permitCount: labPermits.length,
+    matchedCount: labPermits.length,
+    errorMessage: '',
+    syncedAt: SEED_TIME,
+    createdAt: SEED_TIME,
+    updatedAt: SEED_TIME,
+    revision: ROW_REVISION,
+  };
+
+  // 串级放行按顺序重算：面积 ×（可用水深 − 当前水位）给受纳容量，
+  // 排在前面的放行计划先占余量，结果回填到走水计划（计划量 / 水位均不改）。
+  const clearanceMap = new Map(
+    evaluateClearance({ ponds, gates, observations, schedules, permits: labPermits }).map((item) => [
+      item.scheduleId,
+      item,
+    ]),
+  );
+  schedules.forEach((schedule) => {
+    const result = clearanceMap.get(schedule.id);
+    if (result === undefined) return;
+    schedule.clearance = result.clearance;
+    schedule.permitId = result.permitId;
+    schedule.permitVersion = result.permitVersion;
+    schedule.clearanceNote = result.note;
+    schedule.waitingForPondId = result.waitingForPondId;
+    schedule.shortfallM3 = result.shortfallM3;
+    schedule.clearanceCheckedAt = SEED_TIME;
+  });
+
+  await db.transaction(
+    'rw',
+    [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.labPermits, db.syncBatches],
+    async () => {
     await db.ponds.bulkPut(ponds);
     await db.gates.bulkPut(gates);
     await db.observations.bulkPut(observations);
     await db.assays.bulkPut(assays);
     await db.schedules.bulkPut(schedules);
+    await db.labPermits.bulkPut(labPermits);
+    await db.syncBatches.put(syncBatch);
   });
 }
