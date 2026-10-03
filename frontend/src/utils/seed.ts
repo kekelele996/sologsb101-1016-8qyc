@@ -4,11 +4,13 @@
  * 所有 id 固定，保证 /gates、/observations、/assays、/schedules 打开就有真实串级与数据。
  */
 import { db, ROW_REVISION } from './db';
+import { labDb } from './labClient';
 import type { Pond } from '../types/pond';
 import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { DischargePermit } from '../types/permit';
 import { autoVerdict, estimateEvapMm } from './brine';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
@@ -129,12 +131,19 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
+  // 串级容量账本（按面积与最近观测水位）：北-02 受纳 360 m³、北-03 受纳 272 m³、南-05 受纳 144 m³。
+  // a1 已放走 200 m³（北-02 余 160）：紧随的 a2 要 440，差 280 排队；
+  // b1 许可已被化验室撤回 → 重判拦下（不占容量）；
+  // d1 已放走 100 m³（南-05 余 44）：紧随的 d2 要 300，差 256 排队；
+  // c1 为末端锂盐池，无下游，许可有效即放行。
   const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 200, operator: '韩江', state: '已排', orderIndex: 1 }),
+    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 100, operator: '王锐', state: '走水中', orderIndex: 2 }),
+    wrap<Schedule>({ id: 'schedule-a2', pondId: SEED_IDS.pondA, planDate: '2026-10-05', targetDensity: 1.12, volumeM3: 440, operator: '韩江', state: '待排', orderIndex: 3 }),
+    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '待排', orderIndex: 4 }),
+    wrap<Schedule>({ id: 'schedule-d2', pondId: SEED_IDS.pondD, planDate: '2026-10-08', targetDensity: 1.1, volumeM3: 300, operator: '王锐', state: '待排', orderIndex: 5 }),
+    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 6 }),
+    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 7 }),
   ];
 
   await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
@@ -144,4 +153,58 @@ export async function seedDatabase(): Promise<void> {
     await db.assays.bulkPut(assays);
     await db.schedules.bulkPut(schedules);
   });
+}
+
+/**
+ * 化验室系统演示许可播种（独立库 gbbrinepond-lab，幂等）。
+ * 注意：这里写的是「化验室侧原件」，台账镜像要靠同步动作拉过去，
+ * 以演示外部系统 → 只读镜像 → 串级核放的完整链路。
+ *
+ * 覆盖：
+ * - 北-01 / 2026-09-22：批准 v1（对应 schedule-a1，走水到北-02）
+ * - 南-04 / 2026-09-24：批准 v1（对应 schedule-d1，走水到南-05）
+ * - 北-02 / 2026-09-14：批准 v1 已撤回（对应 schedule-b1，演示许可撤回重判）
+ * - 北-03 / 2026-09-18：批准 v1（末端锂盐池，对应 schedule-c1，直放）
+ */
+function labPermit(
+  id: string,
+  pondCode: string,
+  sampledAt: string,
+  version: number,
+  supersedesId: string,
+  approvedVolumeM3: number,
+  status: DischargePermit['status'],
+  issuedAt: string,
+  labName = '盐湖中心化验室',
+): DischargePermit {
+  return {
+    id,
+    permitNo: `CK-${pondCode}-${sampledAt.replace(/-/g, '')}-v${version}`,
+    pondCode,
+    sampledAt,
+    labName,
+    status,
+    version,
+    supersedesId,
+    approvedVolumeM3,
+    issuedAt,
+    syncState: '待同步',
+    syncedAt: '',
+    syncError: '',
+    syncAttempts: 0,
+    createdAt: issuedAt,
+    updatedAt: issuedAt,
+    revision: 1,
+  };
+}
+
+export async function seedLabPermits(): Promise<void> {
+  if ((await labDb.permits.count()) > 0) return;
+  const permits: DischargePermit[] = [
+    labPermit('lab-a1', '北-01', '2026-09-22', 1, '', 1200, '批准', '2026-09-23T02:10:00.000Z'),
+    labPermit('lab-d1', '南-04', '2026-09-24', 1, '', 1600, '批准', '2026-09-25T01:40:00.000Z', '南部化验站'),
+    labPermit('lab-b1', '北-02', '2026-09-14', 1, '', 900, '撤回', '2026-09-15T03:00:00.000Z'),
+    labPermit('lab-c1', '北-03', '2026-09-18', 1, '', 600, '批准', '2026-09-19T02:30:00.000Z'),
+  ];
+  await labDb.permits.bulkPut(permits);
 }

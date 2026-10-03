@@ -7,6 +7,7 @@ import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
+import { useClearanceStore } from '../stores/clearanceStore';
 import { DB_NAME, DB_SCHEMA_VERSION, exportSnapshot, importSnapshot, resetDatabase } from '../utils/db';
 import { buildBriefingText, copyText, exportProgressCsvFile, exportSnapshotJson, parseSnapshot } from '../utils/export';
 import { effectiveVerdict } from '../utils/brine';
@@ -17,11 +18,23 @@ const BTN_DANGER = 'rounded-md bg-rose-600 px-3.5 py-1.5 text-sm font-medium tex
 
 export default function ExportView() {
   const store = usePondStore();
+  const clearanceStore = useClearanceStore();
   const [message, setMessage] = createSignal('');
   const [resetOpen, setResetOpen] = createSignal(false);
 
   onMount(() => {
     void store.loadAll();
+  });
+
+  const clearanceSummary = createMemo(() => {
+    const active = clearanceStore.state.clearances.filter((row) => row.active);
+    return {
+      permits: clearanceStore.state.permits.length,
+      released: active.filter((row) => row.decision === '放行').length,
+      queued: active.filter((row) => row.decision === '排队').length,
+      blocked: active.filter((row) => row.decision === '无有效许可' || row.decision === '许可撤回').length,
+      shortfall: Math.round(active.reduce((acc, row) => acc + row.shortfallM3, 0) * 10) / 10,
+    };
   });
 
   const summary = createMemo(() => {
@@ -87,9 +100,11 @@ export default function ExportView() {
 
   const handleReset = async (): Promise<void> => {
     await resetDatabase();
+    // 许可属化验室另一套系统（独立库）：台账镜像被清空后，从化验室重新拉一遍
+    await clearanceStore.syncFromLab();
     await store.loadAll();
     setResetOpen(false);
-    setMessage('已重置为演示数据');
+    setMessage('已重置为演示数据，并已从化验室重新同步出卤许可');
   };
 
   return (
@@ -107,13 +122,18 @@ export default function ExportView() {
           hint="区间内判定为「达标」的化验记录占比"
         />
         <StatBadge label="出卤候选池" value={summary().readyPonds} suffix="口" tone="success" />
+        <StatBadge label="许可镜像" value={clearanceSummary().permits} suffix="张" tone="info" hint="化验室系统出卤许可的只读镜像数，按池号 + 取样日期对齐" />
+        <StatBadge label="核放放行" value={clearanceSummary().released} suffix="条" tone="success" />
+        <StatBadge label="核放排队" value={clearanceSummary().queued} suffix="条" tone="warning" hint="串级下游受纳容量不足，按顺序排队候放" />
+        <StatBadge label="排队总缺口" value={clearanceSummary().shortfall} suffix="m³" tone="warning" />
+        <StatBadge label="无许可/撤回" value={clearanceSummary().blocked} suffix="条" tone="default" />
         <StatBadge label="出卤完成率" value={`${summary().donePct}%`} percent={summary().donePct} tone="primary" />
         <StatBadge
           label="数据结构版本"
           value={`v${DB_SCHEMA_VERSION}`}
           suffix={`· ${DB_NAME}`}
           tone="default"
-          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录"
+          hint="IndexedDB 库名与结构版本；v2 新增 evapMm 并迁移旧记录，v3 新增化验室许可镜像与串级放行核定两张表"
         />
       </div>
 

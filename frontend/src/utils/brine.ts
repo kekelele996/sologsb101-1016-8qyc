@@ -65,6 +65,16 @@ export function pondVolumeM3(areaM2: number, depthCm: number): number {
   return Math.round(areaM2 * (depthCm / 100) * 10) / 10;
 }
 
+/**
+ * 受纳容量（m³）= 面积 × 可用水深
+ * 可用水深 = 有效水深 − 当前水位；水位达到/超过有效水深时容量为 0。
+ * 串级核放时下游池能接多少水全靠它：上游先放走的水会逐笔扣减这个余量。
+ */
+export function receivingCapacityM3(areaM2: number, depthCm: number, levelCm: number): number {
+  const availableDepthCm = Math.max(0, depthCm - levelCm);
+  return Math.round(areaM2 * (availableDepthCm / 100) * 10) / 10;
+}
+
 /** 闸门过流面积（㎡）= 口宽(m) × 开度对应水深(m) */
 export function gateFlowAreaM2(gate: Pick<Gate, 'widthCm' | 'openingPct'>): number {
   const widthM = gate.widthCm / 100;

@@ -114,12 +114,27 @@ function createScheduleStore() {
     setState('lastMessage', '走水计划已删除');
   }
 
-  async function advance(scheduleId: string): Promise<ScheduleState | null> {
+  async function advance(scheduleId: string): Promise<ScheduleState | 'blocked' | null> {
     const existing = state.rows.find((row) => row.id === scheduleId);
     if (existing === undefined) return null;
     const index = SCHEDULE_STATE_FLOW.indexOf(existing.state);
     if (index < 0 || index >= SCHEDULE_STATE_FLOW.length - 1) return null;
     const next = SCHEDULE_STATE_FLOW[index + 1];
+    // 串级核放闸门：待排 → 已排 必须拿到「放行」核定；排队 / 无许可 / 撤回一律拦下。
+    // 已排 / 走水中继续推进不拦（水已在走），但核定台账会保留许可变动的重判提示。
+    if (existing.state === '待排') {
+      const rows = await db.clearances.where('scheduleId').equals(scheduleId).toArray();
+      const active = rows.filter((row) => row.active).sort((a, b) => b.decidedAt.localeCompare(a.decidedAt))[0];
+      if (active === undefined || active.decision !== '放行') {
+        setState(
+          'lastMessage',
+          active === null || active === undefined
+            ? '串级尚未核放，请先在化验室同步许可后重核'
+            : `串级核放未放行：${active.reason}`,
+        );
+        return 'blocked';
+      }
+    }
     const pondStore = usePondStore();
     const stat = pondStore.statOf(existing.pondId);
     const actualDensity = stat.currentDensity > 0 ? stat.currentDensity : existing.targetDensity;

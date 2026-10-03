@@ -12,7 +12,9 @@ import StatBadge from '../components/common/StatBadge';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
 import { useScheduleStore } from '../stores/scheduleStore';
+import { useClearanceStore } from '../stores/clearanceStore';
 import { SCHEDULE_STATE_OPTIONS, type Schedule, type ScheduleDraft, type ScheduleState } from '../types/schedule';
+import type { ClearanceDecision } from '../types/clearance';
 import { effectiveVerdict } from '../utils/brine';
 import { today } from '../utils/id';
 
@@ -31,6 +33,17 @@ const STATE_STYLE: Record<ScheduleState, string> = {
   已出卤: 'border-emerald-300 bg-emerald-50 text-emerald-700',
 };
 
+const CLEARANCE_STYLE: Record<ClearanceDecision, string> = {
+  放行: 'border-emerald-300 bg-emerald-50 text-emerald-700',
+  排队: 'border-amber-300 bg-amber-50 text-amber-700',
+  无有效许可: 'border-rose-300 bg-rose-50 text-rose-700',
+  许可撤回: 'border-rose-300 bg-rose-50 text-rose-700',
+  已作废: 'border-slate-300 bg-slate-100 text-slate-500',
+};
+
+const BTN_LAB =
+  'rounded-md border border-violet-300 bg-violet-50 px-3 py-1.5 text-xs text-violet-700 transition hover:bg-violet-100 disabled:opacity-50';
+
 function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
   return {
     pondId,
@@ -46,11 +59,14 @@ function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
 export default function ScheduleBoard() {
   const pondStore = usePondStore();
   const scheduleStore = useScheduleStore();
+  const clearanceStore = useClearanceStore();
 
   const [dialogOpen, setDialogOpen] = createSignal(false);
   const [editingId, setEditingId] = createSignal<string | null>(null);
   const [deleting, setDeleting] = createSignal<Schedule | null>(null);
   const [dragOverId, setDragOverId] = createSignal<string | null>(null);
+  const [labOpen, setLabOpen] = createSignal(false);
+  const [issueForm, setIssueForm] = createStore({ pondCode: '', sampledAt: today(), approvedVolumeM3: 800, supersedesId: '' });
   const [draft, setDraft] = createStore<ScheduleDraft>(emptyDraft('', 1));
 
   onMount(() => {
@@ -95,6 +111,55 @@ export default function ScheduleBoard() {
       donePct: list.length === 0 ? 0 : Math.round((list.filter((row) => row.state === '已出卤').length / list.length) * 1000) / 10,
     };
   });
+
+  /** 当前串级核放统计（只看在途计划的有效核定） */
+  const clearanceStats = createMemo(() => {
+    const active = clearanceStore.state.clearances.filter((row) => row.active);
+    return {
+      released: active.filter((row) => row.decision === '放行').length,
+      queued: active.filter((row) => row.decision === '排队').length,
+      blocked: active.filter((row) => row.decision === '无有效许可' || row.decision === '许可撤回').length,
+      shortfall: Math.round(active.reduce((acc, row) => acc + row.shortfallM3, 0) * 10) / 10,
+    };
+  });
+
+  /** 化验室侧现行许可（演示用，只读展示） */
+  const labPermitRows = createMemo(() =>
+    [...clearanceStore.state.permits].sort((a, b) =>
+      a.pondCode.localeCompare(b.pondCode, 'zh-Hans-CN') || b.version - a.version || b.issuedAt.localeCompare(a.issuedAt),
+    ),
+  );
+
+  const openIssue = (supersedesId = ''): void => {
+    const source = supersedesId === '' ? null : clearanceStore.state.permits.find((permit) => permit.id === supersedesId) ?? null;
+    setIssueForm({
+      pondCode: source?.pondCode ?? pondStore.state.ponds[0]?.code ?? '',
+      sampledAt: source?.sampledAt ?? today(),
+      approvedVolumeM3: source?.approvedVolumeM3 ?? 800,
+      supersedesId,
+    });
+    setLabOpen(true);
+  };
+
+  const submitIssue = async (): Promise<void> => {
+    if (issueForm.pondCode === '' || issueForm.sampledAt === '') {
+      scheduleStore.setMessage('请填写池号与取样日期');
+      return;
+    }
+    const permit = await clearanceStore.labIssue({
+      pondCode: issueForm.pondCode,
+      sampledAt: issueForm.sampledAt,
+      labName: '盐湖中心化验室',
+      approvedVolumeM3: issueForm.approvedVolumeM3,
+      supersedesId: issueForm.supersedesId === '' ? undefined : issueForm.supersedesId,
+    });
+    setLabOpen(false);
+    scheduleStore.setMessage(
+      issueForm.supersedesId === ''
+        ? `化验室已签发 ${permit.permitNo}，台账同步后已按串级重核`
+        : `化验室已换发 ${permit.permitNo}（v${permit.version}），旧许可放行已重新判定`,
+    );
+  };
 
   const openCreate = (): void => {
     const pondId = pondStore.pondsOfSeries(pondStore.state.currentSeries)[0]?.id ?? pondStore.state.ponds[0]?.id ?? '';
@@ -169,6 +234,133 @@ export default function ScheduleBoard() {
           {scheduleStore.state.lastMessage}
         </div>
       </Show>
+
+      {/* 化验室出卤许可同步面板：台账只读，写操作全在化验室侧 */}
+      <section class="rounded-xl border border-violet-200 bg-violet-50/40 p-4">
+        <header class="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 class="text-[15px] font-semibold text-slate-800">化验室出卤许可（外部系统 · 台账只读）</h2>
+            <p class="mt-0.5 text-xs text-slate-500">
+              许可由化验室另一套系统签发，晒程台账按「池号 + 取样日期」对齐镜像，不改许可内容；
+              换新许可后按旧许可放行的计划自动重新判定。
+            </p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button type="button" class={BTN_LAB} onClick={() => void clearanceStore.syncFromLab()} disabled={clearanceStore.state.syncing}>
+              {clearanceStore.state.syncing ? '同步中…' : '从化验室同步 / 失败重试'}
+            </button>
+            <button type="button" class={BTN_LAB} onClick={() => void clearanceStore.recheckNow()}>
+              按串级重新核放
+            </button>
+            <button type="button" class={BTN_LAB} onClick={() => openIssue('')}>
+              化验室签发新许可
+            </button>
+            <button type="button" class={BTN_LAB} onClick={() => clearanceStore.armNextSyncFailure()}>
+              模拟同步故障
+            </button>
+          </div>
+        </header>
+        <div class="mb-2.5 flex flex-wrap gap-3 text-xs text-slate-600">
+          <span>
+            放行 <span class="font-semibold text-emerald-700">{clearanceStats().released}</span> 条
+          </span>
+          <span>
+            排队 <span class="font-semibold text-amber-700">{clearanceStats().queued}</span> 条
+          </span>
+          <span>
+            无许可 / 撤回 <span class="font-semibold text-rose-700">{clearanceStats().blocked}</span> 条
+          </span>
+          <span>
+            排队总缺口 <span class="font-semibold tabular-nums text-amber-700">{clearanceStats().shortfall}</span> m³
+          </span>
+          <Show when={clearanceStore.state.lastSyncFailed}>
+            <span class="font-medium text-rose-700">上次同步失败：化验室侧未确认，请重试（重送不多出放行）</span>
+          </Show>
+        </div>
+        <Show
+          when={labPermitRows().length > 0}
+          fallback={<p class="text-xs text-slate-500">尚未同步到任何许可，点「从化验室同步」拉取。</p>}
+        >
+          <div class="overflow-x-auto rounded-lg border border-violet-100 bg-white">
+            <table class="w-full min-w-[860px] border-collapse text-xs">
+              <thead>
+                <tr class="border-b border-violet-100 bg-violet-50/60 text-left text-slate-500">
+                  <th class="px-3 py-2">许可号</th>
+                  <th class="px-3 py-2">池号</th>
+                  <th class="px-3 py-2">取样日期</th>
+                  <th class="px-3 py-2 text-right">批准量(m³)</th>
+                  <th class="px-3 py-2">版本</th>
+                  <th class="px-3 py-2">状态</th>
+                  <th class="px-3 py-2">化验室</th>
+                  <th class="px-3 py-2">镜像同步</th>
+                  <th class="px-3 py-2">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <For each={labPermitRows()}>
+                  {(permit) => (
+                    <tr class="border-b border-slate-100 last:border-0">
+                      <td class="px-3 py-2 font-medium text-slate-700">{permit.permitNo}</td>
+                      <td class="px-3 py-2">{permit.pondCode}</td>
+                      <td class="px-3 py-2">{permit.sampledAt}</td>
+                      <td class="px-3 py-2 text-right tabular-nums">{permit.approvedVolumeM3}</td>
+                      <td class="px-3 py-2">
+                        v{permit.version}
+                        {permit.supersedesId !== '' ? <span class="ml-1 text-slate-400">（换发）</span> : ''}
+                      </td>
+                      <td class="px-3 py-2">
+                        <span
+                          class={`rounded border px-1.5 py-0.5 ${
+                            permit.status === '批准'
+                              ? 'border-emerald-300 bg-emerald-50 text-emerald-700'
+                              : 'border-rose-300 bg-rose-50 text-rose-700'
+                          }`}
+                        >
+                          {permit.status}
+                        </span>
+                      </td>
+                      <td class="px-3 py-2 text-slate-500">{permit.labName}</td>
+                      <td class="px-3 py-2">
+                        <span
+                          class={`rounded border px-1.5 py-0.5 ${
+                            permit.syncState === '已同步'
+                              ? 'border-sky-300 bg-sky-50 text-sky-700'
+                              : permit.syncState === '同步失败'
+                                ? 'border-rose-300 bg-rose-50 text-rose-700'
+                                : 'border-slate-300 bg-slate-100 text-slate-500'
+                          }`}
+                        >
+                          {permit.syncState}
+                          {permit.syncAttempts > 1 ? ` ×${permit.syncAttempts}` : ''}
+                        </span>
+                      </td>
+                      <td class="px-3 py-2">
+                        <div class="flex gap-2">
+                          <button
+                            class="text-violet-700 hover:underline disabled:text-slate-300 disabled:no-underline"
+                            disabled={permit.status !== '批准'}
+                            onClick={() => openIssue(permit.id)}
+                            title="化验室换发同池号同取样日期的新版本，旧许可放行自动重判"
+                          >
+                            换发新版
+                          </button>
+                          <button
+                            class="text-rose-600 hover:underline disabled:text-slate-300 disabled:no-underline"
+                            disabled={permit.status !== '批准'}
+                            onClick={() => void clearanceStore.labRevoke(permit.id)}
+                          >
+                            化验室撤回
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+          </div>
+        </Show>
+      </section>
 
       <section class="rounded-xl border border-slate-200 bg-white p-4">
         <header class="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -268,14 +460,51 @@ export default function ScheduleBoard() {
                       </span>
                     </p>
                   </div>
+                  {(() => {
+                    const clearance = clearanceStore.clearanceOf(row.id);
+                    return (
+                      <div class="min-w-[190px] max-w-[300px]">
+                        <Show
+                          when={clearance !== null}
+                          fallback={
+                            <span class="rounded border border-slate-300 bg-slate-100 px-2 py-0.5 text-[11px] text-slate-500">
+                              串级待核
+                            </span>
+                          }
+                        >
+                          <span
+                            class={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] ${CLEARANCE_STYLE[clearance!.decision]}`}
+                            title={clearance!.reason}
+                          >
+                            核放：{clearance!.decision}
+                            <Show when={clearance!.decision === '排队'}>· 第 {clearance!.queueRank} 位 · 差 {clearance!.shortfallM3} m³</Show>
+                          </span>
+                          <p class="mt-1 leading-snug text-[11px] text-slate-500 line-clamp-2" title={clearance!.reason}>
+                            {clearance!.reason}
+                          </p>
+                        </Show>
+                      </div>
+                    );
+                  })()}
                   <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
                   <div class="flex flex-wrap items-center gap-2">
                     <button
                       class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"
-                      disabled={row.state === '已出卤'}
+                      disabled={
+                        row.state === '已出卤' ||
+                        (row.state === '待排' && clearanceStore.clearanceOf(row.id)?.decision !== '放行')
+                      }
+                      title={
+                        row.state === '待排' && clearanceStore.clearanceOf(row.id)?.decision !== '放行'
+                          ? clearanceStore.clearanceOf(row.id)?.reason ?? '串级尚未核放'
+                          : ''
+                      }
                       onClick={async () => {
                         const next = await scheduleStore.advance(row.id);
                         if (next === null) scheduleStore.setMessage('该计划已处于「已出卤」状态');
+                        if (next === 'blocked') {
+                          // 拦截原因已写入 scheduleStore.lastMessage
+                        }
                       }}
                     >
                       {nextStateLabel(row.state)}
@@ -402,6 +631,66 @@ export default function ScheduleBoard() {
         <p class="text-sm leading-relaxed text-slate-600">
           将删除「{pondLabel(deleting()?.pondId ?? '')}」在 {deleting()?.planDate} 的走水计划。
         </p>
+      </AppDialog>
+
+      <AppDialog
+        open={labOpen()}
+        title={issueForm.supersedesId === '' ? '化验室签发新出卤许可（外部系统）' : '化验室换发出卤许可（新版本）'}
+        width="max-w-lg"
+        onClose={() => setLabOpen(false)}
+        footer={
+          <>
+            <button class={BTN_GHOST} onClick={() => setLabOpen(false)}>
+              取消
+            </button>
+            <button class={BTN_PRIMARY} onClick={() => void submitIssue()}>
+              化验室签发并同步
+            </button>
+          </>
+        }
+      >
+        <div class="space-y-3">
+          <p class="rounded-md bg-violet-50 px-3 py-2 text-xs leading-relaxed text-violet-800">
+            此动作发生在化验室系统：晒程台账不能手工录许可。签发后台账自动从化验室同步，
+            并按「池号 + 取样日期」对在途计划重新串级核放；同一许可重送不产生重复放行。
+          </p>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+              <span>池号（与台账按池号对齐）</span>
+              <input
+                class={INPUT}
+                value={issueForm.pondCode}
+                disabled={issueForm.supersedesId !== ''}
+                onInput={(event) => setIssueForm('pondCode', event.currentTarget.value)}
+              />
+            </label>
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+              <span>取样日期</span>
+              <input
+                type="date"
+                class={INPUT}
+                value={issueForm.sampledAt}
+                disabled={issueForm.supersedesId !== ''}
+                onInput={(event) => setIssueForm('sampledAt', event.currentTarget.value)}
+              />
+            </label>
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600 sm:col-span-2">
+              <span>许可放行量上限（m³）</span>
+              <input
+                type="number"
+                step="10"
+                class={INPUT}
+                value={issueForm.approvedVolumeM3}
+                onInput={(event) => setIssueForm('approvedVolumeM3', Number(event.currentTarget.value))}
+              />
+            </label>
+          </div>
+          <Show when={issueForm.supersedesId !== ''}>
+            <p class="text-xs text-slate-500">
+              换发后旧版本许可保留留痕，按旧许可放行的走水计划会立刻按新版本重新判定（计划量与池水位不动）。
+            </p>
+          </Show>
+        </div>
       </AppDialog>
     </div>
   );

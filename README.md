@@ -41,7 +41,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 路由 | @solidjs/router 0.15 | `Router root={App}` 布局路由，全部路径支持深链刷新 |
 | 状态管理 | Solid 原生能力 | `createStore`（pondStore / scheduleStore）+ `createSignal`（observationStore），**不使用 Pinia / Zustand** |
 | UI | Tailwind CSS 3.4 | 全部界面手写 Tailwind，**不使用 Element Plus / Ant Design / Vue / React** |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v1 → v2` 新增 `evapMm` 并迁移旧记录 |
+| 本地持久化 | Dexie 4（IndexedDB） | 台账库名 `gbbrinepond`（v1→v2 新增 `evapMm`；v3 新增化验室许可镜像 `permits` 与串级放行核定 `clearances` 两表），化验室许可另有独立库 `gbbrinepond-lab` 模拟外部系统 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -100,12 +100,13 @@ sologsb101-1016/
 ## 五、数据存储说明
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
-* **数据库名**：`gbbrinepond`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据库名**：`gbbrinepond`（晒程台账）。
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 **`pondId+date` 复合索引**（`observations`、`assays`）；
   * `db.version(2)`：**新增 `evapMm` 字段**并写入真实升级迁移逻辑 ——
     `.upgrade()` 里对 `observations` 逐行检查，缺失或非法时按密度/温度/水位/风力用经验公式回填默认值；
     同时补齐 `revision` / `createdAt` / `updatedAt`、`assays.verdictManual`、`schedules.orderIndex`。
+  * `db.version(3)`：**新增化验室许可镜像 `permits` 与串级放行核定 `clearances` 两张表**（不改动旧表）。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -115,6 +116,28 @@ sologsb101-1016/
   | `observations` | id | pondId, date, **[pondId+date]**, densityGcm3, evapMm |
   | `assays` | id | pondId, date, **[pondId+date]**, verdict, verdictManual |
   | `schedules` | id | pondId, planDate, state, orderIndex |
+  | `permits` | id | permitNo, **[pondCode+sampledAt]**, status, version, supersedesId, syncState |
+  | `clearances` | id | scheduleId, permitId, decision, active, queueRank, decidedAt |
+
+### 化验室出卤许可与串级核放（`utils/labClient.ts` / `utils/cascade.ts` / `stores/clearanceStore.ts`）
+
+* **许可属另一套系统，台账只读不改**：化验室许可放在独立 IndexedDB 库 `gbbrinepond-lab`（`labClient.ts`）模拟外部系统，
+  晒程台账只保存同步镜像 `permits`，两边按 **池号 `pondCode` + 取样日期 `sampledAt`** 对齐（不按池主键）。
+  台账侧没有手工新建 / 编辑许可的入口，只有「从化验室同步 / 失败重试」；`/schedules` 页的签发 / 换发 / 撤回按钮用于演示外部系统动作。
+* **串级核放**（`adjudicateCascade`，纯函数，`test/cascade.test.ts` 覆盖）：
+  1. 先核许可：池号 + 取样日期对不上批准的现行许可（取版本号最大者）→ `无有效许可` / `许可撤回`，不放行；
+  2. 计划量超过许可批准量上限 → 排队；
+  3. 下游**受纳容量 = 面积 ×（有效水深 − 当前水位）**（`receivingCapacityM3`），多闸按开度权重分摊；
+  4. **按串级顺序（orderIndex → 计划日期）逐条核**：已排 / 走水中的计划按已锁定水量先扣下游余量，
+     排在后面的计划按被扣减后的余量重算；余量不足即 `排队`，并写明**排队顺位与逐池缺口（m³）**；
+  5. 末端池（无出流闸）许可有效即直放。
+  6. 核定只写 `clearances` 结论，**`schedules.volumeM3` 计划量与 `observations.levelCm` 池水位一律不动**；
+     待排计划只有拿到「放行」核定，页面上的「标记已排」才可点。
+* **换新许可重判**：化验室换发同池号同取样日期的新版本（`version+1`、`supersedesId` 指向旧版）后，
+  按旧许可得出的核定自动置 `active=false`、结论改为 `已作废` 留痕，再按新版本重新判定。
+* **同步失败重试 + 幂等**：同步按 `issuedAt` 增量游标拉取，**失败不落库、游标不前移**，重试从化验室侧重取本批；
+  镜像按许可 id 覆盖、核定 id 由「计划 id + 许可 id / 取样日期」派生，**同一批重送不产生重复许可、不多出放行**；
+  同步时另按化验室原件刷新已镜像许可的状态，保证撤回也能感知。`/schedules` 页提供「模拟同步故障」按钮演示该链路。
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `ponds` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排** 三层互相引用：
@@ -122,10 +145,10 @@ sologsb101-1016/
   * 4 条闸门串级（北-01→北-02→北-03、南-04→南-05、跨池系备用闸），1 条关闭用于验证开度联动；
   * 16 条卤水日观测（每池 2–4 条，密度随日期递增，`evapMm` 由经验公式生成）；
   * 6 条离子组分分析（覆盖达标 / 接近 / 未达标，其中 1 条为人工覆盖判定）；
-  * 5 条走水编排（覆盖待排 / 已排 / 走水中 / 已出卤四种状态）。
+  * 7 条走水编排（覆盖待排 / 已排 / 走水中 / 已出卤四种状态）；化验室独立库另播种 4 张许可（批准 / 撤回 / 末端直放）。
   * 固定 id 如 `pond-north-01`、`pond-south-04` 可直接用于验证与二次开发。
-* **其他本地数据**：`localStorage` 仅保存「最近选中的池系」这一界面偏好，不存业务数据。
-* 删除蒸发池会**级联清理**相关闸门（上下游任一为该池）、观测、化验与走水编排（同一 Dexie 事务内完成）。
+* **其他本地数据**：`localStorage` 保存「最近选中的池系」界面偏好与化验室许可同步游标（`gbbrinepond:permitCursor`），不存业务数据。
+* 删除蒸发池会**级联清理**相关闸门（上下游任一为该池）、观测、化验、走水编排及其放行核定（同一 Dexie 事务内完成）；许可镜像属化验室系统，不随台账删除。
 
 ---
 
@@ -143,6 +166,7 @@ npm run dev          # http://localhost:22816
 npm run build        # tsc --noEmit && vite build（零错误）
 npm run typecheck    # 仅做 TypeScript 类型检查
 npm run preview      # 预览 dist 产物
+npm test             # node:test 跑 test/ 下的串级核放纯函数与同步集成测试（tsx + fake-indexeddb）
 ```
 
 ---
@@ -157,3 +181,6 @@ npm run preview      # 预览 dist 产物
   判定达标的池自动进入**出卤候选**；人工覆盖只改写判定标注，原始化验数值保持不变。
 * **闸门过流估算**：`1.7 × 过流面积 × √水头 × 开度`，用于开度调整后的下游进水量即时反馈；开度变化会同步推导闸门状态（关闭 / 半开 / 全开）。
 * **出卤回写**：走水状态推进到「已出卤」时，蒸发池阶段自动推进（钠盐→钾盐→锂盐），并把最新一次观测的密度回写为实际密度。
+* **串级放行（v3 新增）**：放行不再只看调度员目标密度，须同时满足化验室许可（池号 + 取样日期对得上批准现行版本）
+  与下游受纳容量（面积 × 可用水深，按串级顺序逐笔扣减后重算）；不足的按序排队并标明缺口，计划量与水位不动。
+  详见「五、数据存储说明 → 化验室出卤许可与串级核放」。
